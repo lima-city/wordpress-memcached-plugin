@@ -3,11 +3,13 @@
 /*
 Plugin Name: Memcached
 Description: Memcached backend for the WP Object Cache.
-Version: 4.0.0
+Version: 5.0.0
 Plugin URI: https://wordpress.org/plugins/memcached/
-Author: Ryan Boren, Denis de Bernardy, Matt Martz, Andy Skelton
+Author: Ryan Boren, Denis de Bernardy, Matt Martz, Andy Skelton, Phillipp Röll
 
 Install this file to wp-content/object-cache.php
+
+Then, if you are on lima-city hosting, nothing else is needed - it will auto-configure!
 */
 
 // Users with setups where multiple installs share a common wp-config.php or $table_prefix
@@ -173,7 +175,7 @@ class WP_Object_Cache {
 
 		$size = $this->get_data_size( $data );
 		$this->timer_start();
-		$result = $mc->add( $key, $data, false, $expire );
+		$result = $mc->add( $key, $data, $expire );
 		$elapsed = $this->timer_stop();
 
 		$comment = '';
@@ -250,7 +252,7 @@ class WP_Object_Cache {
 
 	function close() {
 		foreach ( $this->mc as $bucket => $mc ) {
-			$mc->close();
+			$mc->quit();
 		}
 	}
 
@@ -285,9 +287,8 @@ class WP_Object_Cache {
 		$values = array();
 		$size = 19; // size of microsecond timestamp serialized
 		foreach ( $this->default_mcs as $i => $mc ) {
-			$flags = false;
 			$this->timer_start();
-			$values[ $i ] = $mc->get( $key, $flags );
+			$values[ $i ] = $mc->get( $key );
 			$elapsed = $this->timer_stop();
 
 			if ( empty( $values[ $i ] ) ) {
@@ -308,7 +309,7 @@ class WP_Object_Cache {
 		foreach ( $this->default_mcs as $i => $mc ) {
 			if ( $values[ $i ] < $max ) {
 				$this->timer_start();
-				$mc->set( $key, $max, false, $expire );
+				$mc->set( $key, $max, $expire );
 				$elapsed = $this->timer_stop();
 				$this->group_ops_stats( 'set_flush_number', $key, $group, $size, $elapsed, 'replication_repair' );
 			}
@@ -323,7 +324,7 @@ class WP_Object_Cache {
 		$size = 19;
 		foreach ( $this->default_mcs as $i => $mc ) {
 			$this->timer_start();
-			$mc->set( $key, $value, false, $expire );
+			$mc->set( $key, $value, $expire );
 			$elapsed = $this->timer_stop();
 			$this->group_ops_stats( 'set_flush_number', $key, $group, $size, $elapsed, 'replication' );
 		}
@@ -429,13 +430,12 @@ class WP_Object_Cache {
 
 			$this->group_ops_stats( 'get_local', $key, $group, null, null, 'not_in_local' );
 		} else {
-			$flags = false;
 			$this->timer_start();
-			$value = $mc->get( $key, $flags );
+			$value = $mc->get( $key );
 			$elapsed = $this->timer_stop();
 
 			// Value will be unchanged if the key doesn't exist.
-			if ( false === $flags ) {
+			if ( $mc->getResultCode() == Memcached::RES_NOTFOUND ) {
 				$found = false;
 				$value = false;
 			}
@@ -571,7 +571,7 @@ class WP_Object_Cache {
 
 		$size = $this->get_data_size( $data );
 		$this->timer_start();
-		$result = $mc->replace( $key, $data, false, $expire );
+		$result = $mc->replace( $key, $data, $expire );
 		$elapsed = $this->timer_stop();
 		$this->group_ops_stats( 'replace', $key, $group, $size, $elapsed );
 
@@ -616,7 +616,7 @@ class WP_Object_Cache {
 
 		$size = $this->get_data_size( $data );
 		$this->timer_start();
-		$result = $mc->set( $key, $data, false, $expire );
+		$result = $mc->set( $key, $data, $expire );
 		$elapsed = $this->timer_stop();
 		$this->group_ops_stats( 'set', $key, $group, $size, $elapsed );
 
@@ -837,6 +837,21 @@ class WP_Object_Cache {
 			$buckets = $memcached_servers;
 		} else {
 			$buckets = array( '127.0.0.1:11211' );
+
+			/*
+				We can, for lima-city hosting, infer the default server socket
+				from the current directory name. The directory name is
+				 /home/webpages/lima-city/username/...
+				 and the memcached socket is always
+				 /usr/share/lima/php-${username}/memcached.sock
+
+			*/
+
+			// check if __dir__ includes /home/webpages/lima-city and then use preg_match to extract username
+			if (preg_match('/\/home\/webpages\/lima-city\/([^\/]+)\//', __DIR__, $matches)) {
+				$username = $matches[1];
+				$buckets = array( '/usr/share/lima/php-' . $username . '/memcached.sock' );
+			}
 		}
 
 		reset( $buckets );
@@ -846,10 +861,10 @@ class WP_Object_Cache {
 		}
 
 		foreach ( $buckets as $bucket => $servers ) {
-			$this->mc[ $bucket ] = new Memcache();
+			$this->mc[ $bucket ] = new Memcached();
 
 			foreach ( $servers as $i => $server  ) {
-				if ( 'unix://' == substr( $server, 0, 7 ) ) {
+				if ( '/' == substr( $server, 0, 1 ) ) {
 					$node = $server;
 					$port = 0;
 				} else {
@@ -866,13 +881,12 @@ class WP_Object_Cache {
 					}
 				}
 
-				$this->mc[ $bucket ]->addServer( $node, $port, true, 1, 1, 15, true, array( $this, 'failure_callback' ) );
-				$this->mc[ $bucket ]->setCompressThreshold( 20000, 0.2 );
+				$this->mc[ $bucket ]->addServer( $node, $port, 10 );
 
 				// Prepare individual connections to servers in default bucket for flush_number redundancy
 				if ( 'default' === $bucket ) {
-					$this->default_mcs[ $i ] = new Memcache();
-					$this->default_mcs[ $i ]->addServer( $node, $port, true, 1, 1, 15, true, array( $this, 'failure_callback' ) );
+					$this->default_mcs[ $i ] = new Memcached();
+					$this->default_mcs[ $i ]->addServer( $node, $port, 10);
 				}
 			}
 		}
