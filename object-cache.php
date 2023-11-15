@@ -850,7 +850,11 @@ class WP_Object_Cache {
 			// check if __dir__ includes /home/webpages/lima-city and then use preg_match to extract username
 			if (preg_match('/\/home\/webpages\/lima-city\/([^\/]+)\//', __DIR__, $matches)) {
 				$username = $matches[1];
-				$buckets = array( '/usr/share/lima/php-' . $username . '/memcached.sock' );
+				$socket_name = '/usr/share/lima/php-' . $username . '/memcached.sock';
+
+				if(file_exists($socket_name) && filetype($socket_name) == 'socket') {
+					$buckets = array($socket_name);
+				}
 			}
 		}
 
